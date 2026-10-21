@@ -118,6 +118,12 @@ jobs:
           git config user.name "${APP_SLUG}[bot]"
           git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
           git add apps/keycloak/overlays/local-qual/kustomization.yaml argocd/keycloak-applicationset.yaml
+
+          if git diff --cached --quiet; then
+            echo "local-qual already references ${IMAGE_TAG}"
+            exit 0
+          fi
+
           git commit -m "Promote keycloak-26-app ${RELEASE_VERSION} (${IMAGE_TAG}) to local-qual"
           git pull --rebase origin main
           git push origin main
