@@ -2,7 +2,7 @@ ARG KEYCLOAK_VERSION=26.8.1
 
 FROM quay.io/keycloak/keycloak:${KEYCLOAK_VERSION} AS builder
 
-ENV KC_DB=postgres \
+ENV KC_DB=mysql \
     KC_HEALTH_ENABLED=true \
     KC_METRICS_ENABLED=true
 
@@ -13,7 +13,7 @@ RUN /opt/keycloak/bin/kc.sh build
 
 FROM quay.io/keycloak/keycloak:${KEYCLOAK_VERSION}
 
-ENV KC_DB=postgres \
+ENV KC_DB=mysql \
     KC_HEALTH_ENABLED=true \
     KC_METRICS_ENABLED=true
 

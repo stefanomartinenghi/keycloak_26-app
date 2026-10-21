@@ -6,7 +6,7 @@ Immagine Keycloak ottimizzata per il cluster Kubernetes locale CCNO.
 
 - Keycloak server: `26.8.1`
 - Keycloak Operator: `26.8.1`, dichiarato nel repository `idm-gitops`
-- database runtime: PostgreSQL
+- database runtime: MySQL (`10.166.18.126:3306/idmccno_keycloak26`)
 
 Server e Operator devono essere aggiornati insieme dopo aver verificato le note di
 migrazione e il backup del database.
