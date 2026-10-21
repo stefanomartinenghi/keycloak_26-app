@@ -1,0 +1,118 @@
+name: Build and release to local-test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - providers/**
+      - themes/**
+      - .dockerignore
+      - .github/workflows/publish-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-keycloak-26-app-local-test
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Publish image and promote local-test
+    runs-on:
+      - self-hosted
+      - idm-local
+    timeout-minutes: 30
+    env:
+      IMAGE_REPOSITORY: localhost:5001/keycloak-26-app
+      IMAGE_TAG: ${{ github.sha }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Verify local delivery services
+        run: |
+          set -euo pipefail
+          docker info >/dev/null
+          curl --fail --silent --show-error http://localhost:5001/v2/ >/dev/null
+
+      - name: Build optimized Keycloak image
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg KEYCLOAK_VERSION=26.8.1 \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=26.8.1" \
+            --tag "${IMAGE_REPOSITORY}:${IMAGE_TAG}" \
+            .
+
+      - name: Verify Keycloak version
+        run: docker run --rm "${IMAGE_REPOSITORY}:${IMAGE_TAG}" --version | grep -F "26.8.1"
+
+      - name: Push immutable image
+        run: docker push "${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+
+      - name: Verify image in registry
+        run: |
+          set -euo pipefail
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --header "Accept: application/vnd.oci.image.manifest.v1+json" \
+            "http://localhost:5001/v2/keycloak-26-app/manifests/${IMAGE_TAG}" \
+            >/dev/null
+
+      - name: Create GitHub App token for idm-gitops
+        id: gitops-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: idm-gitops
+          permission-contents: write
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/idm-gitops
+          ref: main
+          token: ${{ steps.gitops-token.outputs.token }}
+          path: idm-gitops
+
+      - name: Update local-test image
+        run: |
+          set -euo pipefail
+          overlay="idm-gitops/apps/keycloak/overlays/local-test/kustomization.yaml"
+          sed -i -E "s/^([[:space:]]*newTag:).*/\1 ${IMAGE_TAG}/" "${overlay}"
+          grep -q "newTag: ${IMAGE_TAG}" "${overlay}"
+          kubectl kustomize idm-gitops/apps/keycloak/overlays/local-test >/dev/null
+
+      - name: Commit local-test promotion
+        env:
+          APP_SLUG: ${{ steps.gitops-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          cd idm-gitops
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git add apps/keycloak/overlays/local-test/kustomization.yaml
+
+          if git diff --cached --quiet; then
+            echo "local-test already references ${IMAGE_TAG}"
+            exit 0
+          fi
+
+          git commit -m "Deploy keycloak-26-app ${IMAGE_TAG} to local-test"
+          git pull --rebase origin main
+          git push origin main
+
+      - name: Remove local image
+        if: always()
+        run: docker image rm "${IMAGE_REPOSITORY}:${IMAGE_TAG}" >/dev/null 2>&1 || true
+

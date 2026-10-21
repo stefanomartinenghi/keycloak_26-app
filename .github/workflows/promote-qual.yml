@@ -1,0 +1,124 @@
+name: Promote tagged image to local-qual
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to promote
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-keycloak-26-app-local-qual
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    outputs:
+      image-tag: ${{ steps.release.outputs.image-tag }}
+      release-version: ${{ steps.release.outputs.release-version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - id: release
+        name: Resolve and validate release
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Release tag must use vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          }
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          image_tag="$(git rev-list -n 1 "${RELEASE_TAG}")"
+          git merge-base --is-ancestor "${image_tag}" origin/main || {
+            echo "Tag must reference a commit on main" >&2
+            exit 1
+          }
+          echo "image-tag=${image_tag}" >> "${GITHUB_OUTPUT}"
+          echo "release-version=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+
+  promote:
+    needs: validate-tag
+    runs-on:
+      - self-hosted
+      - idm-local
+    environment: local-qual
+    timeout-minutes: 20
+    env:
+      IMAGE_REPOSITORY: localhost:5001/keycloak-26-app
+      IMAGE_TAG: ${{ needs.validate-tag.outputs.image-tag }}
+      RELEASE_VERSION: ${{ needs.validate-tag.outputs.release-version }}
+    steps:
+      - name: Verify immutable image
+        run: |
+          curl --fail --silent --show-error \
+            --header "Accept: application/vnd.oci.image.manifest.v1+json" \
+            "http://localhost:5001/v2/keycloak-26-app/manifests/${IMAGE_TAG}" \
+            >/dev/null
+
+      - name: Create GitHub App token for idm-gitops
+        id: gitops-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: idm-gitops
+          permission-contents: write
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/idm-gitops
+          ref: main
+          token: ${{ steps.gitops-token.outputs.token }}
+          path: idm-gitops
+
+      - name: Update local-qual desired state
+        run: |
+          set -euo pipefail
+          overlay="idm-gitops/apps/keycloak/overlays/local-qual/kustomization.yaml"
+          applicationset="idm-gitops/argocd/keycloak-applicationset.yaml"
+          sed -i -E "s/^([[:space:]]*newTag:).*/\1 ${IMAGE_TAG}/" "${overlay}"
+
+          if ! grep -q "^[[:space:]]*- environment: local-qual$" "${applicationset}"; then
+            python3 - "${applicationset}" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path(sys.argv[1])
+          content = path.read_text(encoding="utf-8")
+          anchor = "          - environment: local-test\n            namespace: keycloak-test\n"
+          addition = "          - environment: local-qual\n            namespace: keycloak-qual\n"
+          if anchor not in content:
+              raise SystemExit("local-test entry not found")
+          path.write_text(content.replace(anchor, anchor + addition, 1), encoding="utf-8")
+          PY
+          fi
+
+          kubectl kustomize idm-gitops/apps/keycloak/overlays/local-qual >/dev/null
+
+      - name: Commit local-qual promotion
+        env:
+          APP_SLUG: ${{ steps.gitops-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          cd idm-gitops
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git add apps/keycloak/overlays/local-qual/kustomization.yaml argocd/keycloak-applicationset.yaml
+          git commit -m "Promote keycloak-26-app ${RELEASE_VERSION} (${IMAGE_TAG}) to local-qual"
+          git pull --rebase origin main
+          git push origin main
+
